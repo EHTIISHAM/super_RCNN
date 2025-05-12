@@ -1,8 +1,14 @@
 import torch
+import torch.nn as nn
 import torchvision
-from torchvision.models.detection import FasterRCNN
-from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
+from torchvision.ops import MultiScaleRoIAlign
 from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.models.detection.rpn import RPNHead, RegionProposalNetwork
+from torchvision.ops import boxes as box_ops
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.roi_heads import RoIHeads
+from torchvision.models.detection.transform import GeneralizedRCNNTransform
+from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.datasets import CocoDetection
 from torch.utils.data import DataLoader
 import torch.optim as optim
@@ -10,116 +16,192 @@ from tqdm import tqdm
 import os
 import time
 from torchvision.transforms import v2 as transforms
-def create_faster_rcnn(num_classes, backbone_name='resnet50', pretrained=True, trainable_layers=3):
-    """
-    Create Faster R-CNN model with adjustable backbone (ResNet variants with FPN)
-    
-    Args:
-        num_classes (int): Number of output classes (including background)
-        backbone_name (str): ResNet backbone name ('resnet18', 'resnet34', 'resnet50', etc.)
-        pretrained (bool): Use pretrained weights for backbone
-        trainable_layers (int): Number of backbone layers to train (0-5)
-        
-    Returns:
-        FasterRCNN model
-    """
-    # Create backbone with FPN
-    backbone = resnet_fpn_backbone(
-        backbone_name=backbone_name,
-        pretrained=pretrained,
-        trainable_layers=trainable_layers
-    )
-    
-    # Create Faster R-CNN model
-    model = FasterRCNN(
-        backbone,
-        num_classes=num_classes,
-        min_size=800,       # Minimum input size
-        max_size=1333       # Maximum input size
-    )
-    
-    return model
 
-def create_custom_backbone_model(num_classes, backbone_arch='vgg16', pretrained=True):
-    """
-    Create Faster R-CNN with custom backbone (supports VGG, DenseNet, EfficientNet, MobileNet)
-    
-    Args:
-        num_classes (int): Number of output classes
-        backbone_arch (str): Backbone architecture name
-        pretrained (bool): Use pretrained weights
+class CustomFPN(nn.Module):
+    """Feature Pyramid Network for any backbone"""
+    def __init__(self, backbone, in_channels_list, out_channels=256):
+        super().__init__()
+        self.inner_blocks = nn.ModuleList()
+        self.layer_blocks = nn.ModuleList()
         
-    Returns:
-        FasterRCNN model
-    """
-    backbone = None
-    anchor_sizes = ((32, 64, 128, 256, 512),)  # Default anchor sizes
-    aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+        # Add 1x1 conv for channel reduction
+        for in_channels in in_channels_list:
+            self.inner_blocks.append(nn.Conv2d(in_channels, out_channels, 1))
+            self.layer_blocks.append(nn.Conv2d(out_channels, out_channels, 3, padding=1))
 
-    # Create custom backbone
-    if backbone_arch == 'vgg16':
+    def forward(self, x):
+        # x = OrderedDict of feature maps from backbone
+        last_inner = self.inner_blocks[-1](list(x.values())[-1])
+        results = [self.layer_blocks[-1](last_inner)]
+        
+        for idx in range(len(x)-2, -1, -1):
+            inner_lateral = self.inner_blocks[idx](list(x.values())[idx])
+            feat_shape = inner_lateral.shape[-2:]
+            inner_top_down = nn.functional.interpolate(last_inner, size=feat_shape, mode="nearest")
+            last_inner = inner_lateral + inner_top_down
+            results.insert(0, self.layer_blocks[idx](last_inner))
+
+        return {str(i): v for i, v in enumerate(results)}
+
+class CustomBackbone(nn.Module):
+    """Wrapper for any backbone with FPN and 1x1 conv"""
+    def __init__(self, backbone, return_layers, in_channels_list, fpn_out_channels=256):
+        super().__init__()
+        self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
+        self.fpn = CustomFPN(backbone, in_channels_list, fpn_out_channels)
+        self.out_channels = fpn_out_channels
+
+    def forward(self, x):
+        x = self.body(x)
+        return self.fpn(x)
+
+class FeatureExtractingRoIHeads(RoIHeads):
+    def forward(self, features, proposals, image_shapes, targets=None):
+        """
+        Modified forward pass to include features in outputs
+        """
+        # Original processing
+        box_features = self.box_roi_pool(features, proposals, image_shapes)
+        box_features = self.box_head(box_features)
+        
+        # Store features before final prediction
+        features_before_predictor = box_features.clone()
+        
+        # Get predictions
+        class_logits, box_regression = self.box_predictor(box_features)
+
+        # Post-process detections
+        result, losses = self.postprocess_detections(
+            class_logits, box_regression, proposals, image_shapes
+        )
+        
+        # Add features to results
+        if not self.training:
+            for res in result:
+                res['features'] = features_before_predictor
+        return result, losses
+
+class CustomFasterRCNN(nn.Module):
+    def __init__(self, backbone, num_classes,backbone_arch, min_size=800, max_size=1333):
+        super().__init__()
+        self.backbone = backbone
+        self.transform = GeneralizedRCNNTransform(min_size, max_size, 
+                                                 [0.485, 0.456, 0.406],
+                                                 [0.229, 0.224, 0.225])
+        
+        # RPN Configuration
+        if backbone_arch.startswith('resnet'):
+          anchor_sizes = ((32,), (64,), (128,), (256,))
+          aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+        elif backbone_arch == 'vgg16':
+          anchor_sizes = ((32,), (64,), (128,))
+          aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+        else:
+          #default
+          anchor_sizes = ((32,), (64,), (128,), (256,))
+          aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+        rpn_anchor_generator = AnchorGenerator(anchor_sizes, aspect_ratios)
+        rpn_head = RPNHead(backbone.out_channels, len(aspect_ratios[0]))
+        
+        self.rpn = RegionProposalNetwork(
+            rpn_anchor_generator, rpn_head,
+            fg_iou_thresh=0.7,
+            bg_iou_thresh=0.3,
+            batch_size_per_image=256,
+            positive_fraction=0.5,
+            pre_nms_top_n={'training': 2000, 'testing': 1000},
+            post_nms_top_n={'training': 2000, 'testing': 1000},
+            nms_thresh=0.7
+        )
+
+        # ROI Heads Configuration
+        box_roi_pool = MultiScaleRoIAlign(
+            featmap_names=['0', '1', '2', '3'],
+            output_size=7,
+            sampling_ratio=2
+        )
+        
+        resolution = box_roi_pool.output_size[0]
+        representation_size = 1024
+        
+        box_head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(backbone.out_channels * resolution ** 2, representation_size),
+            nn.ReLU(),
+            nn.Linear(representation_size, representation_size))
+        
+        box_predictor = FastRCNNPredictor(representation_size, num_classes)
+
+        self.roi_heads = RoIHeads(
+            # Box parameters
+            box_roi_pool=box_roi_pool,
+            box_head=box_head,
+            box_predictor=box_predictor,
+            fg_iou_thresh=0.5,
+            bg_iou_thresh=0.5,
+            batch_size_per_image=512,
+            positive_fraction=0.25,
+            bbox_reg_weights=None,
+            score_thresh=0.05,
+            nms_thresh=0.5,
+            detections_per_img=100
+        )
+
+    def forward(self, images, targets=None):
+        original_image_sizes = [img.shape[-2:] for img in images]
+        images, targets = self.transform(images, targets)
+        features = self.backbone(images.tensors)
+        
+        proposals, proposal_losses = self.rpn(images, features, targets)
+        detections, detector_losses = self.roi_heads(features, proposals, 
+                                                   images.image_sizes, targets)
+        
+        if not self.training:
+            detections = self.transform.postprocess(
+                detections, images.image_sizes, original_image_sizes
+            )
+        
+        return detections
+
+    
+def create_custom_faster_rcnn(num_classes, backbone_arch='resnet50', pretrained=True):
+    # Create base backbone
+    if backbone_arch.startswith('resnet'):
+        backbone = torchvision.models.__dict__[backbone_arch](pretrained=pretrained)
+        return_layers = {'layer1': '0', 'layer2': '1', 'layer3': '2', 'layer4': '3'}
+        in_channels_list = [256, 512, 1024, 2048][:4]
+    elif backbone_arch == 'vgg16':
         backbone = torchvision.models.vgg16(pretrained=pretrained).features
-        backbone.out_channels = 512
-        
-    elif backbone_arch == 'densenet121':
-        backbone = torchvision.models.densenet121(pretrained=pretrained).features
-        backbone.out_channels = 1024
-        anchor_sizes = ((64, 128, 256, 512, 1024),)  # Adjusted for DenseNet's deeper features
-        
-    elif backbone_arch.startswith('efficientnet'):
-        if backbone_arch == 'efficientnet_b0':
-            backbone = torchvision.models.efficientnet_b0(pretrained=pretrained).features
-            backbone.out_channels = 1280
-        elif backbone_arch == 'efficientnet_b4':
-            backbone = torchvision.models.efficientnet_b4(pretrained=pretrained).features
-            backbone.out_channels = 1792
-        anchor_sizes = ((16, 32, 64, 128, 256),)  # Smaller anchors for EfficientNet's high-resolution features
-        
-    elif backbone_arch.startswith('mobilenet'):
-        if 'v3_large' in backbone_arch:
-            backbone = torchvision.models.mobilenet_v3_large(pretrained=pretrained).features
-            backbone.out_channels = 960
-        elif 'v3_small' in backbone_arch:
-            backbone = torchvision.models.mobilenet_v3_small(pretrained=pretrained).features
-            backbone.out_channels = 576
-        anchor_sizes = ((16, 32, 64, 128, 256),)  # Smaller anchors for mobile-oriented networks
-        
-    else:
+        return_layers = {'16': '0', '23': '1', '30': '2'}
+        in_channels_list = [256, 512, 512]
+    else:  # Add other architectures similarly
         raise ValueError(f"Unsupported backbone: {backbone_arch}")
 
-    # Define anchor generator with updated sizes
-    anchor_generator = AnchorGenerator(anchor_sizes, aspect_ratios)
-
-    # Define ROI pooler (adjust based on backbone)
-    roi_pooler = torchvision.ops.MultiScaleRoIAlign(
-        featmap_names=['0'],  # Use only the final feature map
-        output_size=7,
-        sampling_ratio=2
-    )
-
-    # Create model
-    model = FasterRCNN(
-        backbone,
-        num_classes=num_classes,
-        rpn_anchor_generator=anchor_generator,
-        box_roi_pool=roi_pooler,
-        min_size=600,  # Can adjust based on backbone
-        max_size=1000   # Can adjust based on backbone
-    )
+    # Wrap with FPN and 1x1 conv
+    backbone = CustomBackbone(backbone, return_layers, in_channels_list)
     
-    return model
+    return CustomFasterRCNN(backbone, num_classes,backbone_arch)
 
 
 # Dataset setup
 def get_transform(train):
     transform_list = transforms.Compose([
-        transforms.ToImage(),
+        transforms.ToImage(),  # Converts to tensor and handles PIL/Numpy inputs
         transforms.ToDtype(torch.float32, scale=True),
+        
+        # Convert RGB to BGR by reversing channels
+        transforms.Lambda(lambda x: x[[2, 1, 0],]),  # Channel order: BGR
+        
+        # Continue with standard augmentations
         transforms.RandomHorizontalFlip(0.5 if train else 0),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
         transforms.Resize((800, 1333), antialias=True),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                           std=[0.229, 0.224, 0.225])
+        
+        # Adjust normalization for BGR format (original ImageNet RGB mean/std reversed)
+        transforms.Normalize(
+            mean=[0.406, 0.456, 0.485],  # BGR mean (original RGB [0.485, 0.456, 0.406])
+            std=[0.225, 0.224, 0.229]    # BGR std (original RGB [0.229, 0.224, 0.225])
+        )
     ])
     return transform_list
 
@@ -183,7 +265,7 @@ def collate_fn(batch):
 
 # Training function
 def train_model(
-    model: FasterRCNN,
+    model,
     train_dataset,
     val_dataset,
     num_epochs=10,
@@ -203,7 +285,7 @@ def train_model(
         num_workers=4,
         pin_memory=True
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=1,
@@ -224,7 +306,7 @@ def train_model(
 
     # Move model to device
     model = model.to(device)
-    
+
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -232,12 +314,12 @@ def train_model(
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
         model.train()
-        
+
         # Initialize metrics
         epoch_loss = 0.0
         last_loss = 0.0
         start_time = time.time()
-        
+
         # Training phase
         with tqdm(train_loader, unit="batch") as tepoch:
             for batch_idx, batch in enumerate(tepoch):
@@ -253,17 +335,16 @@ def train_model(
 
                 # Forward pass
                 loss_dict = model(images, targets)
-                losses = sum(loss for loss in loss_dict.values())
-
+                losses = sum(loss.mean() if isinstance(loss, torch.Tensor) else torch.tensor(loss, device=device) 
+                         for loss in loss_dict)  
                 # Backward pass
                 optimizer.zero_grad()
-                losses.backward()
                 optimizer.step()
 
                 # Update metrics
-                epoch_loss += losses.item()
-                last_loss = losses.item()
-                
+                epoch_loss += losses
+                last_loss = losses
+
                 # Update progress bar
                 tepoch.set_postfix({
                     'loss': f"{last_loss:.4f}",
@@ -273,7 +354,7 @@ def train_model(
         # Calculate epoch metrics
         epoch_loss /= len(train_loader)
         epoch_time = time.time() - start_time
-        
+
         print(f"Train Loss: {epoch_loss:.4f} | Time: {epoch_time:.2f}s")
 
         # Validation phase
@@ -286,11 +367,11 @@ def train_model(
 
                 # Forward pass
                 loss_dict = model(images, targets)
-                losses = sum(loss for loss in loss_dict.values())
-                val_loss += losses.item()
+                losses = sum(loss for loss in loss_dict)
+                val_loss += losses
 
                 vepoch.set_postfix({
-                    'val_loss': f"{losses.item():.4f}"
+                    'val_loss': f"{losses:.4f}"
                 })
 
         val_loss /= len(val_loader)
@@ -308,7 +389,7 @@ def train_model(
             'train_loss': epoch_loss,
             'val_loss': val_loss,
         }, checkpoint_path)
-        
+
     return model
 
 # Example usage
@@ -332,11 +413,11 @@ if __name__ == "__main__":
         transforms=get_transform(train=False)
     )
     # Create VGG16 based model
-    model = create_custom_backbone_model(
+    model = create_custom_faster_rcnn(
         num_classes=91,
-        backbone_arch='mobilenet_v3_large'
+        backbone_arch='vgg16'
     )
-    
+
     # Train the model
     trained_model = train_model(
         model,
