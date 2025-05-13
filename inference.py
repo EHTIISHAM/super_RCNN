@@ -23,7 +23,7 @@ def show_prediction(model, img_path, confidence_threshold=0.7, device='cuda'):
     # Run inference
     model.eval()
     with torch.no_grad():
-        predictions = model(img_tensor)
+        predictions,losses = model(img_tensor)
 
     # Move predictions to CPU and convert to numpy
     pred_boxes = predictions[0]['boxes'].cpu().numpy()
