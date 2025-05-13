@@ -23,7 +23,7 @@ class CustomFPN(nn.Module):
         super().__init__()
         self.inner_blocks = nn.ModuleList()
         self.layer_blocks = nn.ModuleList()
-        
+
         # Add 1x1 conv for channel reduction
         for in_channels in in_channels_list:
             self.inner_blocks.append(nn.Conv2d(in_channels, out_channels, 1))
@@ -33,7 +33,7 @@ class CustomFPN(nn.Module):
         # x = OrderedDict of feature maps from backbone
         last_inner = self.inner_blocks[-1](list(x.values())[-1])
         results = [self.layer_blocks[-1](last_inner)]
-        
+
         for idx in range(len(x)-2, -1, -1):
             inner_lateral = self.inner_blocks[idx](list(x.values())[idx])
             feat_shape = inner_lateral.shape[-2:]
@@ -63,10 +63,10 @@ class FeatureExtractingRoIHeads(RoIHeads):
         # Original processing
         box_features = self.box_roi_pool(features, proposals, image_shapes)
         box_features = self.box_head(box_features)
-        
+
         # Store features before final prediction
         features_before_predictor = box_features.clone()
-        
+
         # Get predictions
         class_logits, box_regression = self.box_predictor(box_features)
 
@@ -74,7 +74,7 @@ class FeatureExtractingRoIHeads(RoIHeads):
         result, losses = self.postprocess_detections(
             class_logits, box_regression, proposals, image_shapes
         )
-        
+
         # Add features to results
         if not self.training:
             for res in result:
@@ -85,10 +85,10 @@ class CustomFasterRCNN(nn.Module):
     def __init__(self, backbone, num_classes,backbone_arch, min_size=800, max_size=1333):
         super().__init__()
         self.backbone = backbone
-        self.transform = GeneralizedRCNNTransform(min_size, max_size, 
+        self.transform = GeneralizedRCNNTransform(min_size, max_size,
                                                  [0.485, 0.456, 0.406],
                                                  [0.229, 0.224, 0.225])
-        
+
         # RPN Configuration
         if backbone_arch.startswith('resnet'):
           anchor_sizes = ((32,), (64,), (128,), (256,))
@@ -102,7 +102,7 @@ class CustomFasterRCNN(nn.Module):
           aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
         rpn_anchor_generator = AnchorGenerator(anchor_sizes, aspect_ratios)
         rpn_head = RPNHead(backbone.out_channels, len(aspect_ratios[0]))
-        
+
         self.rpn = RegionProposalNetwork(
             rpn_anchor_generator, rpn_head,
             fg_iou_thresh=0.7,
@@ -120,16 +120,16 @@ class CustomFasterRCNN(nn.Module):
             output_size=7,
             sampling_ratio=2
         )
-        
+
         resolution = box_roi_pool.output_size[0]
         representation_size = 1024
-        
+
         box_head = nn.Sequential(
             nn.Flatten(),
             nn.Linear(backbone.out_channels * resolution ** 2, representation_size),
             nn.ReLU(),
             nn.Linear(representation_size, representation_size))
-        
+
         box_predictor = FastRCNNPredictor(representation_size, num_classes)
 
         self.roi_heads = RoIHeads(
@@ -151,19 +151,22 @@ class CustomFasterRCNN(nn.Module):
         original_image_sizes = [img.shape[-2:] for img in images]
         images, targets = self.transform(images, targets)
         features = self.backbone(images.tensors)
-        
+
         proposals, proposal_losses = self.rpn(images, features, targets)
-        detections, detector_losses = self.roi_heads(features, proposals, 
+        detections, detector_losses = self.roi_heads(features, proposals,
                                                    images.image_sizes, targets)
-        
+
+        losses = {}
+        losses.update(proposal_losses)
+        losses.update(detector_losses)
         if not self.training:
             detections = self.transform.postprocess(
                 detections, images.image_sizes, original_image_sizes
             )
-        
-        return detections
 
-    
+        return detections,losses
+
+
 def create_custom_faster_rcnn(num_classes, backbone_arch='resnet50', pretrained=True):
     # Create base backbone
     if backbone_arch.startswith('resnet'):
@@ -179,7 +182,7 @@ def create_custom_faster_rcnn(num_classes, backbone_arch='resnet50', pretrained=
 
     # Wrap with FPN and 1x1 conv
     backbone = CustomBackbone(backbone, return_layers, in_channels_list)
-    
+
     return CustomFasterRCNN(backbone, num_classes,backbone_arch)
 
 
@@ -188,15 +191,15 @@ def get_transform(train):
     transform_list = transforms.Compose([
         transforms.ToImage(),  # Converts to tensor and handles PIL/Numpy inputs
         transforms.ToDtype(torch.float32, scale=True),
-        
+
         # Convert RGB to BGR by reversing channels
         transforms.Lambda(lambda x: x[[2, 1, 0],]),  # Channel order: BGR
-        
+
         # Continue with standard augmentations
         transforms.RandomHorizontalFlip(0.5 if train else 0),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
         transforms.Resize((800, 1333), antialias=True),
-        
+
         # Adjust normalization for BGR format (original ImageNet RGB mean/std reversed)
         transforms.Normalize(
             mean=[0.406, 0.456, 0.485],  # BGR mean (original RGB [0.485, 0.456, 0.406])
@@ -265,16 +268,10 @@ def collate_fn(batch):
 
 # Training function
 def train_model(
-    model,
-    train_dataset,
-    val_dataset,
-    num_epochs=10,
-    batch_size=4,
-    lr=0.005,
-    momentum=0.9,
-    weight_decay=0.0005,
-    checkpoint_dir='checkpoints',
-    device='cuda'
+    model, train_dataset, val_dataset,
+    num_epochs=10, batch_size=4, lr=0.005,
+    momentum=0.9, weight_decay=0.0005,
+    checkpoint_dir='checkpoints', device='cuda'
 ):
     # Create data loaders
     train_loader = DataLoader(
@@ -295,102 +292,63 @@ def train_model(
         pin_memory=True
     )
 
-    # Optimizer setup
-    params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.SGD(
-        params,
-        lr=lr,
-        momentum=momentum,
-        weight_decay=weight_decay
+        [p for p in model.parameters() if p.requires_grad],
+        lr=lr, momentum=momentum, weight_decay=weight_decay
     )
-
-    # Move model to device
-    model = model.to(device)
-
-    # Create checkpoint directory
+    model.to(device)
     os.makedirs(checkpoint_dir, exist_ok=True)
-
-    # Training loop
+    
     for epoch in range(num_epochs):
-        print(f"\nEpoch {epoch+1}/{num_epochs}")
         model.train()
-
-        # Initialize metrics
         epoch_loss = 0.0
-        last_loss = 0.0
         start_time = time.time()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        for batch_idx, (images, targets) in enumerate(pbar, start=1):
+            images = [img.to(device) for img in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        # Training phase
-        with tqdm(train_loader, unit="batch") as tepoch:
-            for batch_idx, batch in enumerate(tepoch):
-                images, targets = batch
+            detections,loss_dict = model(images, targets)
+            loss = sum(loss for loss in loss_dict.values())
 
-                if batch is None or (batch[0] is None and batch[1] is None):
-                    continue
-                if len(images) == 0 or any(len(t["boxes"]) == 0 for t in targets):
-                    continue
-                # Move data to device
-                images = [image.to(device) for image in images]
-                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-                # Forward pass
-                loss_dict = model(images, targets)
-                losses = sum(loss.mean() if isinstance(loss, torch.Tensor) else torch.tensor(loss, device=device) 
-                         for loss in loss_dict)  
-                # Backward pass
-                optimizer.zero_grad()
-                optimizer.step()
+            batch_loss = loss.item()
+            epoch_loss += batch_loss
+            avg_loss = epoch_loss / batch_idx
+            pbar.set_postfix({'batch_loss': f"{batch_loss:.4f}", 'avg_loss': f"{avg_loss:.4f}"})
 
-                # Update metrics
-                epoch_loss += losses
-                last_loss = losses
+        avg_loss = epoch_loss / len(train_loader)
+        print(f"Train Loss: {avg_loss:.4f} | Time: {time.time() - start_time:.2f}s")
 
-                # Update progress bar
-                tepoch.set_postfix({
-                    'loss': f"{last_loss:.4f}",
-                    'avg_loss': f"{epoch_loss/(batch_idx+1):.4f}"
-                })
-
-        # Calculate epoch metrics
-        epoch_loss /= len(train_loader)
-        epoch_time = time.time() - start_time
-
-        print(f"Train Loss: {epoch_loss:.4f} | Time: {epoch_time:.2f}s")
-
-        # Validation phase
+        # Validation
         model.eval()
         val_loss = 0.0
-        with torch.no_grad(), tqdm(val_loader, unit="batch") as vepoch:
-            for images, targets in vepoch:
-                images = [image.to(device) for image in images]
-                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        with torch.no_grad():
+            for images, targets in tqdm(val_loader, desc="Validation"):
+                images = [img.to(device) for img in images]
+                targets = [{k: v.to(device) for k,v in t.items()} for t in targets]
 
-                # Forward pass
-                loss_dict = model(images, targets)
-                losses = sum(loss for loss in loss_dict)
-                val_loss += losses
+                detection,loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
+                val_loss += losses.item()
 
-                vepoch.set_postfix({
-                    'val_loss': f"{losses:.4f}"
-                })
+        avg_val_loss = val_loss / len(val_loader)
+        print(f"Validation Loss: {avg_val_loss:.4f}")
 
-        val_loss /= len(val_loader)
-        print(f"Validation Loss: {val_loss:.4f}")
-
-        # Save checkpoint
-        checkpoint_path = os.path.join(
-            checkpoint_dir,
-            f"frcnn_epoch_{epoch+1}_loss_{val_loss:.4f}.pth"
-        )
+        # Checkpoint
         torch.save({
             'epoch': epoch+1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'train_loss': epoch_loss,
-            'val_loss': val_loss,
-        }, checkpoint_path)
+            'train_loss': avg_loss,
+            'val_loss': avg_val_loss
+        }, os.path.join(checkpoint_dir, f"frcnn_epoch_{epoch+1}.pth"))
 
     return model
+
 
 # Example usage
 if __name__ == "__main__":
@@ -424,7 +382,7 @@ if __name__ == "__main__":
         train_ds,
         val_ds,
         num_epochs=1,
-        batch_size=4,
-        lr=0.005,
+        batch_size=6,
+        lr=0.0001,
         device='cuda' if torch.cuda.is_available() else 'cpu'
     )
