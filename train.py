@@ -330,8 +330,9 @@ def train_model(
             for images, targets in tqdm(val_loader, desc="Validation"):
                 images = [img.to(device) for img in images]
                 targets = [{k: v.to(device) for k,v in t.items()} for t in targets]
-
+                model.train() # Force the model to return loss during validation as in eval model just ignores it
                 detection,loss_dict = model(images, targets)
+                model.eval() # return to eval state
                 losses = sum(loss for loss in loss_dict.values())
                 val_loss += losses.item()
 
