@@ -16,6 +16,8 @@ from tqdm import tqdm
 import os
 import time
 from torchvision.transforms import v2 as transforms
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
 class CustomFPN(nn.Module):
     """Feature Pyramid Network for any backbone"""
@@ -264,6 +266,34 @@ def collate_fn(batch):
         return None, None  # Handle in training loop
     return tuple(zip(*batch))
 
+def show_prediction(model, dataset, device, num_images=2):
+    model.eval()
+    fig, axs = plt.subplots(1, num_images, figsize=(16, 8))
+    if num_images == 1:
+        axs = [axs]
+
+    for i in range(num_images):
+        image, _ = dataset[i]
+        img_tensor = image.to(device).unsqueeze(0)
+
+        with torch.no_grad():
+            preds = model(img_tensor)[0]
+
+        img_np = image.permute(1, 2, 0).cpu().numpy()
+        axs[i].imshow(img_np)
+        axs[i].axis("off")
+
+        for box in preds["boxes"].cpu():
+            x1, y1, x2, y2 = box
+            rect = patches.Rectangle(
+                (x1, y1), x2 - x1, y2 - y1,
+                linewidth=2, edgecolor='red', facecolor='none'
+            )
+            axs[i].add_patch(rect)
+
+    plt.tight_layout()
+    plt.show()
+
 # Training function
 def train_model(
     model, train_dataset, val_dataset,
@@ -345,7 +375,10 @@ def train_model(
             'train_loss': avg_loss,
             'val_loss': avg_val_loss
         }, os.path.join(checkpoint_dir, f"frcnn_epoch_{epoch+1}.pth"))
-
+        # Show predictions
+        if (epoch + 1) % show_every_n_epochs == 0:
+            print(f"Showing predictions at epoch {epoch+1}")
+            show_prediction(model, val_dataset, device)
     return model
 
 
