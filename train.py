@@ -196,9 +196,7 @@ def get_transform(train):
         transforms.Lambda(lambda x: x[[2, 1, 0],]),  # Channel order: BGR
 
         # Continue with standard augmentations
-        transforms.RandomHorizontalFlip(0.5 if train else 0),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-        transforms.Resize((800, 1333), antialias=True),
 
         # Adjust normalization for BGR format (original ImageNet RGB mean/std reversed)
         transforms.Normalize(
