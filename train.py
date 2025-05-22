@@ -266,7 +266,7 @@ def collate_fn(batch):
         return None, None  # Handle in training loop
     return tuple(zip(*batch))
 
-def show_prediction(model, dataset, device, num_images=2):
+def show_prediction(model, dataset, device, num_images=2, class_names=None, score_threshold=0.1):
     model.eval()
     fig, axs = plt.subplots(1, num_images, figsize=(16, 8))
     if num_images == 1:
@@ -279,24 +279,43 @@ def show_prediction(model, dataset, device, num_images=2):
         with torch.no_grad():
             preds = model(img_tensor)[0]
 
+
         img_np = image.permute(1, 2, 0).cpu().numpy()
         axs[i].imshow(img_np)
         axs[i].axis("off")
 
-        for box in preds["boxes"].cpu():
+        boxes = preds[0]["boxes"].cpu()
+        labels = preds[0]["labels"].cpu()
+        scores = preds[0]["scores"].cpu()
+
+        for box, label, score in zip(boxes, labels, scores):
+            if score < score_threshold:
+                continue
+
             x1, y1, x2, y2 = box
+            class_name = str(label.item())
+            if class_names:
+                class_name = class_names.get(label.item(), f"class_{label.item()}")
+
+            caption = f"{class_name}: {score.item()*100:.1f}%"
+
             rect = patches.Rectangle(
                 (x1, y1), x2 - x1, y2 - y1,
                 linewidth=2, edgecolor='red', facecolor='none'
             )
             axs[i].add_patch(rect)
 
+            axs[i].text(
+                x1, y1 - 5, caption,
+                fontsize=10, color='white', backgroundcolor='red'
+            )
+
     plt.tight_layout()
     plt.show()
 
 # Training function
 def train_model(
-    model, train_dataset, val_dataset,
+    model, train_dataset, val_dataset,show_every_n_epochs=1,
     num_epochs=10, batch_size=4, lr=0.005,
     momentum=0.9, weight_decay=0.0005,
     checkpoint_dir='checkpoints', device='cuda'
@@ -326,13 +345,14 @@ def train_model(
     )
     model.to(device)
     os.makedirs(checkpoint_dir, exist_ok=True)
-    
+
     for epoch in range(num_epochs):
         model.train()
         epoch_loss = 0.0
         start_time = time.time()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         for batch_idx, (images, targets) in enumerate(pbar, start=1):
+            
             images = [img.to(device) for img in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
@@ -356,6 +376,10 @@ def train_model(
         val_loss = 0.0
         with torch.no_grad():
             for images, targets in tqdm(val_loader, desc="Validation"):
+                
+                if images is None or targets is None:
+                    continue
+
                 images = [img.to(device) for img in images]
                 targets = [{k: v.to(device) for k,v in t.items()} for t in targets]
                 model.train() # Force the model to return loss during validation as in eval model just ignores it
@@ -381,7 +405,6 @@ def train_model(
             show_prediction(model, val_dataset, device)
     return model
 
-
 # Example usage
 if __name__ == "__main__":
     # Crea
@@ -391,12 +414,7 @@ if __name__ == "__main__":
     val_root = "val2017"
     val_ann = "annotations/instances_val2017.json"
 
-    # Create datasets
-    train_ds = CocoDataset(
-        img_folder=train_root,
-        ann_file=train_ann,
-        transforms=get_transform(train=True)
-    )
+
     val_ds = CocoDataset(
         img_folder=val_root,
         ann_file=val_ann,
@@ -411,10 +429,10 @@ if __name__ == "__main__":
     # Train the model
     trained_model = train_model(
         model,
-        train_ds,
+        val_ds,
         val_ds,
         num_epochs=1,
-        batch_size=6,
+        batch_size=4,
         lr=0.0001,
         device='cuda' if torch.cuda.is_available() else 'cpu'
     )
